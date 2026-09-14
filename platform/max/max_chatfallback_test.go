@@ -122,14 +122,18 @@ func TestReconstructReplyCtxKeepsUserID(t *testing.T) {
 // Raw "perm:allow_all" matched nothing, so "Allow all" silently did nothing
 // while "Allow" worked by accident (the engine tokenises and finds "allow").
 func TestCallbackTranslatesPermissionPayloads(t *testing.T) {
+	// Payloads come from the constants (single source of truth with the sender
+	// side), but the expected words are spelled out on purpose: taking them from
+	// permPayloads would make the test agree with itself instead of pinning the
+	// exact wording the engine matches on.
 	cases := []struct {
 		payload string
 		want    string
 		perm    bool
 	}{
-		{"perm:allow", "allow", true},
-		{"perm:allow_all", "allow all", true},
-		{"perm:deny", "deny", true},
+		{payloadAllow, "allow", true},
+		{payloadAllowAll, "allow all", true},
+		{payloadDeny, "deny", true},
 		{"cb_play", "cb_play", false}, // ordinary buttons pass through untouched
 	}
 

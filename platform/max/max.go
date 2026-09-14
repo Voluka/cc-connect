@@ -47,6 +47,10 @@ const (
 )
 
 // replyContext carries the information needed to send a reply.
+//
+// chatID == "0" means the update came from a private-dialog callback, where MAX
+// omits recipient.chat_id. Always check hasChat() before using chatID as a send
+// target; when it reports false, userID is the one to address (see postMessage).
 type replyContext struct {
 	chatID    string
 	userID    string // fallback target: MAX omits recipient.chat_id in private-dialog callbacks
@@ -58,6 +62,28 @@ type replyContext struct {
 // then rejects as "chat.denied: Invalid chatId: 0", so "0" counts as missing.
 func (r replyContext) hasChat() bool {
 	return r.chatID != "" && r.chatID != "0"
+}
+
+// Permission button payloads, and what each one has to become before the engine
+// can act on it: the engine matches plain words ("allow", "allow all", "deny"),
+// so forwarding the raw payload worked for perm:allow only by accident —
+// tokenisation happens to find the "allow" token — and silently did nothing for
+// perm:allow_all. label is what the card is edited to show after the press.
+const (
+	payloadAllow    = "perm:allow"
+	payloadAllowAll = "perm:allow_all"
+	payloadDeny     = "perm:deny"
+)
+
+type permDecision struct {
+	token string
+	label string
+}
+
+var permPayloads = map[string]permDecision{
+	payloadAllow:    {token: "allow", label: "✅ Allowed"},
+	payloadAllowAll: {token: "allow all", label: "✅ Allow All"},
+	payloadDeny:     {token: "deny", label: "❌ Denied"},
 }
 
 // Platform implements core.Platform for the MAX messenger bot API.
@@ -89,6 +115,15 @@ type Platform struct {
 	// chatOfUser remembers each user's private-dialog chat_id, learned from
 	// their incoming messages. MAX omits recipient.chat_id in callbacks, so
 	// without this a button press would open a parallel "max:0:<user>" session.
+	//
+	// Process-local by design, like dedup: it assumes a single cc-connect
+	// instance per bot token, which is also what MAX long-polling requires (two
+	// pollers on one token split updates between them). Running several
+	// instances behind a load balancer would let one learn the chat_id while
+	// another handles the callback, reviving the bug this cache exists to fix;
+	// that deployment shape needs a shared cache and is not supported today.
+	// Replies still work in that case — postMessage falls back to user_id — but
+	// the press lands in a separate session.
 	chatOfUser sync.Map // userID(string) -> chatID(string)
 }
 
@@ -1316,24 +1351,14 @@ func (p *Platform) handleCallback(ctx context.Context, cb *maxCallback) {
 
 	slog.Debug("max: callback received", "user", cb.User.Name, "payload", cb.Payload)
 
-	// Permission buttons carry "perm:*" payloads, but the engine matches plain
-	// words ("allow", "allow all", "deny"). Passing the raw payload through
-	// happened to work for "perm:allow" — tokenisation finds the "allow" token —
-	// and silently failed for "perm:allow_all", which matches nothing. Translate
-	// like the Telegram platform does, and flag the message so a stale click is
-	// dropped instead of reaching the agent as user input.
+	// Translate permission payloads like the Telegram platform does, and flag the
+	// message so a stale click is dropped instead of reaching the agent as user
+	// input. Any other payload (ordinary buttons) passes through untouched.
 	content := cb.Payload
-	isPerm := true
+	isPerm := false
 	choice := ""
-	switch cb.Payload {
-	case "perm:allow":
-		content, choice = "allow", "✅ Allowed"
-	case "perm:deny":
-		content, choice = "deny", "❌ Denied"
-	case "perm:allow_all":
-		content, choice = "allow all", "✅ Allow All"
-	default:
-		isPerm = false
+	if d, ok := permPayloads[cb.Payload]; ok {
+		content, choice, isPerm = d.token, d.label, true
 	}
 
 	handler := p.getHandler()
@@ -1349,7 +1374,14 @@ func (p *Platform) handleCallback(ctx context.Context, cb *maxCallback) {
 			origText = "(permission request)"
 		}
 		if err := p.UpdateMessage(ctx, rctx, origText+"\n\n"+choice); err != nil {
-			slog.Debug("max: permission callback edit failed", "error", err)
+			// 403/404 means the chat is gone — the user left between the message
+			// and the press. That is worth noticing; a transient blip is not.
+			if e := err.Error(); strings.Contains(e, "403") || strings.Contains(e, "404") {
+				slog.Warn("max: permission callback edit failed (chat no longer accessible)",
+					"error", err, "user", cb.User.Name)
+			} else {
+				slog.Debug("max: permission callback edit failed", "error", err)
+			}
 		}
 	}
 
