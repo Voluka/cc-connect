@@ -31,7 +31,7 @@ const (
 	// pollTimeout, otherwise transient MAX backend lag pushes header arrival
 	// past the deadline and the client cancels the long-poll, triggering a
 	// retry storm.
-	httpTimeout = 90 * time.Second
+	httpTimeout             = 90 * time.Second
 	initialReconnectBackoff = time.Second
 	maxReconnectBackoff     = 30 * time.Second
 	stableConnectionWindow  = 10 * time.Second
@@ -49,7 +49,15 @@ const (
 // replyContext carries the information needed to send a reply.
 type replyContext struct {
 	chatID    string
+	userID    string // fallback target: MAX omits recipient.chat_id in private-dialog callbacks
 	messageID string // populated from incoming message, used only by UpdateMessage
+}
+
+// hasChat reports whether chatID can be used as a send target. MAX delivers
+// callbacks from private dialogs with recipient.chat_id = 0, which the API
+// then rejects as "chat.denied: Invalid chatId: 0", so "0" counts as missing.
+func (r replyContext) hasChat() bool {
+	return r.chatID != "" && r.chatID != "0"
 }
 
 // Platform implements core.Platform for the MAX messenger bot API.
@@ -77,6 +85,11 @@ type Platform struct {
 	uploadClient *http.Client // CDN uploads — attachmentUploadTO (overrides short client Timeout)
 	dedup        core.MessageDedup
 	webServer    *http.Server
+
+	// chatOfUser remembers each user's private-dialog chat_id, learned from
+	// their incoming messages. MAX omits recipient.chat_id in callbacks, so
+	// without this a button press would open a parallel "max:0:<user>" session.
+	chatOfUser sync.Map // userID(string) -> chatID(string)
 }
 
 // New creates a MAX platform from config options.
@@ -429,7 +442,7 @@ func (p *Platform) SendImage(ctx context.Context, replyCtx any, img core.ImageAt
 			Payload: maxTokenPayload{Token: token},
 		}},
 	}
-	return p.postMessage(ctx, rctx.chatID, body)
+	return p.postMessage(ctx, rctx, body)
 }
 
 // SendFile implements core.FileSender. MAX routes images uploaded via the file
@@ -463,7 +476,7 @@ func (p *Platform) SendFile(ctx context.Context, replyCtx any, file core.FileAtt
 			Payload: maxTokenPayload{Token: token},
 		}},
 	}
-	return p.postMessage(ctx, rctx.chatID, body)
+	return p.postMessage(ctx, rctx, body)
 }
 
 // SendAudio implements core.AudioSender — uploads a voice/audio blob and sends
@@ -487,7 +500,7 @@ func (p *Platform) SendAudio(ctx context.Context, replyCtx any, audio []byte, fo
 			Payload: maxTokenPayload{Token: token},
 		}},
 	}
-	return p.postMessage(ctx, rctx.chatID, body)
+	return p.postMessage(ctx, rctx, body)
 }
 
 // UpdateMessage implements core.MessageUpdater via PUT /messages?message_id=.
@@ -665,7 +678,9 @@ func defaultFilename(kind string) string {
 // re-arm it on a ticker until the returned cancel func is called.
 func (p *Platform) StartTyping(ctx context.Context, replyCtx any) (stop func()) {
 	rctx, ok := replyCtx.(replyContext)
-	if !ok || rctx.chatID == "" {
+	// Typing needs a real chat: POST /chats/{id}/actions has no user_id form,
+	// so a callback-only context (chat_id = 0) simply skips the indicator.
+	if !ok || !rctx.hasChat() {
 		return func() {}
 	}
 	tickCtx, cancel := context.WithCancel(ctx)
@@ -740,11 +755,12 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("max: cannot reconstruct reply ctx from %q", sessionKey)
 	}
-	chatID, _, _ := strings.Cut(rest, ":")
-	if chatID == "" {
+	chatID, userID, _ := strings.Cut(rest, ":")
+	// A "max:0:<user>" key is still usable: postMessage falls back to user_id.
+	if chatID == "" || (chatID == "0" && userID == "") {
 		return nil, fmt.Errorf("max: cannot reconstruct reply ctx from %q", sessionKey)
 	}
-	return replyContext{chatID: chatID}, nil
+	return replyContext{chatID: chatID, userID: userID}, nil
 }
 
 // --- MAX API types ---
@@ -988,8 +1004,13 @@ func (p *Platform) handleMessage(ctx context.Context, msg *maxMessage) {
 	}
 
 	chatID := strconv.FormatInt(msg.Recipient.ChatID, 10)
+	if chatID != "0" && chatID != "" {
+		// Remember the dialog so callbacks (which arrive without recipient.chat_id)
+		// can be routed to the same session instead of spawning "max:0:<user>".
+		p.chatOfUser.Store(userID, chatID)
+	}
 	sessionKey := fmt.Sprintf("max:%s:%s", chatID, userID)
-	rctx := replyContext{chatID: chatID, messageID: msg.Body.Mid}
+	rctx := replyContext{chatID: chatID, userID: userID, messageID: msg.Body.Mid}
 
 	// Acknowledge the message so the user gets a "read" tick in MAX.
 	// Fire-and-forget — must never block the routing flow.
@@ -1280,24 +1301,67 @@ func (p *Platform) handleCallback(ctx context.Context, cb *maxCallback) {
 		return
 	}
 
+	// MAX does not fill recipient.chat_id for callbacks from private dialogs,
+	// so fall back to the chat_id learned from this user's earlier messages.
+	// Without it the press lands in a separate "max:0:<user>" session and the
+	// reply is POSTed to chat_id=0, which MAX rejects with chat.denied.
 	chatID := strconv.FormatInt(cb.Message.Recipient.ChatID, 10)
+	if chatID == "0" || chatID == "" {
+		if known, ok := p.chatOfUser.Load(userID); ok {
+			chatID, _ = known.(string)
+		}
+	}
 	sessionKey := fmt.Sprintf("max:%s:%s", chatID, userID)
-	rctx := replyContext{chatID: chatID, messageID: cb.Message.Body.Mid}
+	rctx := replyContext{chatID: chatID, userID: userID, messageID: cb.Message.Body.Mid}
 
 	slog.Debug("max: callback received", "user", cb.User.Name, "payload", cb.Payload)
+
+	// Permission buttons carry "perm:*" payloads, but the engine matches plain
+	// words ("allow", "allow all", "deny"). Passing the raw payload through
+	// happened to work for "perm:allow" — tokenisation finds the "allow" token —
+	// and silently failed for "perm:allow_all", which matches nothing. Translate
+	// like the Telegram platform does, and flag the message so a stale click is
+	// dropped instead of reaching the agent as user input.
+	content := cb.Payload
+	isPerm := true
+	choice := ""
+	switch cb.Payload {
+	case "perm:allow":
+		content, choice = "allow", "✅ Allowed"
+	case "perm:deny":
+		content, choice = "deny", "❌ Denied"
+	case "perm:allow_all":
+		content, choice = "allow all", "✅ Allow All"
+	default:
+		isPerm = false
+	}
 
 	handler := p.getHandler()
 	if handler == nil {
 		return
 	}
+
+	// Best-effort: mark the original card so the user sees which button won and
+	// cannot press it twice. Failure here must not block the decision itself.
+	if choice != "" && rctx.messageID != "" {
+		origText := cb.Message.Body.Text
+		if origText == "" {
+			origText = "(permission request)"
+		}
+		if err := p.UpdateMessage(ctx, rctx, origText+"\n\n"+choice); err != nil {
+			slog.Debug("max: permission callback edit failed", "error", err)
+		}
+	}
+
 	handler(p, &core.Message{
-		SessionKey: sessionKey,
-		Platform:   "max",
-		MessageID:  cb.CallbackID,
-		UserID:     userID,
-		UserName:   cb.User.Name,
-		Content:    cb.Payload,
-		ReplyCtx:   rctx,
+		SessionKey:           sessionKey,
+		Platform:             "max",
+		MessageID:            cb.CallbackID,
+		UserID:               userID,
+		UserName:             cb.User.Name,
+		Content:              content,
+		ReplyCtx:             rctx,
+		IsPermissionResponse: isPerm,
 	})
 }
 
@@ -1362,7 +1426,7 @@ func (p *Platform) sendText(ctx context.Context, replyCtx any, content string, b
 		if i == len(chunks)-1 && len(kbAttachments) > 0 {
 			chunkBody.Attachments = kbAttachments
 		}
-		if err := p.postMessage(ctx, rctx.chatID, &chunkBody); err != nil {
+		if err := p.postMessage(ctx, rctx, &chunkBody); err != nil {
 			return err
 		}
 		if len(chunks) > 1 && i < len(chunks)-1 {
@@ -1375,10 +1439,20 @@ func (p *Platform) sendText(ctx context.Context, replyCtx any, content string, b
 // postMessage sends one /messages request. It is the single HTTP call used by
 // sendText, SendImage, SendFile — kept separate so retry/backoff for
 // "attachment.not.ready" lives in one place.
-func (p *Platform) postMessage(ctx context.Context, chatID string, body *maxSendBody) error {
+func (p *Platform) postMessage(ctx context.Context, rctx replyContext, body *maxSendBody) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
+	}
+	// Target selection: chat_id when MAX gave us one, user_id otherwise.
+	// Private-dialog callbacks arrive with recipient.chat_id = 0 (see hasChat),
+	// and POST /messages?user_id= is the documented way to reach a user directly.
+	target, targetValue := "chat_id", rctx.chatID
+	if !rctx.hasChat() {
+		if rctx.userID == "" {
+			return fmt.Errorf("max: send message: reply context has neither chat_id nor user_id")
+		}
+		target, targetValue = "user_id", rctx.userID
 	}
 	backoff := attachmentReadyDelay
 	for attempt := 0; attempt <= attachmentReadyRetries; attempt++ {
@@ -1388,7 +1462,7 @@ func (p *Platform) postMessage(ctx context.Context, chatID string, body *maxSend
 		}
 		p.setAuth(req)
 		q := req.URL.Query()
-		q.Set("chat_id", chatID)
+		q.Set(target, targetValue)
 		req.URL.RawQuery = q.Encode()
 		req.Header.Set("Content-Type", "application/json")
 
@@ -1412,7 +1486,7 @@ func (p *Platform) postMessage(ctx context.Context, chatID string, body *maxSend
 			backoff *= 2
 			continue
 		}
-		slog.Warn("max: send message failed", "status", resp.StatusCode, "chat", chatID, "body", string(respBody))
+		slog.Warn("max: send message failed", "status", resp.StatusCode, target, targetValue, "body", string(respBody))
 		return fmt.Errorf("max: send message: HTTP %d: %s", resp.StatusCode, respBody)
 	}
 	return fmt.Errorf("max: send message: attachment not ready after %d retries", attachmentReadyRetries)
@@ -1526,13 +1600,13 @@ func splitMessage(text string, maxLen int) []string {
 
 // Compile-time interface compliance assertions.
 var (
-	_ core.Platform                    = (*Platform)(nil)
-	_ core.ImageSender                 = (*Platform)(nil)
-	_ core.FileSender                  = (*Platform)(nil)
-	_ core.AudioSender                 = (*Platform)(nil)
-	_ core.InlineButtonSender          = (*Platform)(nil)
-	_ core.MessageUpdater              = (*Platform)(nil)
-	_ core.TypingIndicator             = (*Platform)(nil)
+	_ core.Platform                      = (*Platform)(nil)
+	_ core.ImageSender                   = (*Platform)(nil)
+	_ core.FileSender                    = (*Platform)(nil)
+	_ core.AudioSender                   = (*Platform)(nil)
+	_ core.InlineButtonSender            = (*Platform)(nil)
+	_ core.MessageUpdater                = (*Platform)(nil)
+	_ core.TypingIndicator               = (*Platform)(nil)
 	_ core.FormattingInstructionProvider = (*Platform)(nil)
-	_ core.ReplyContextReconstructor   = (*Platform)(nil)
+	_ core.ReplyContextReconstructor     = (*Platform)(nil)
 )
